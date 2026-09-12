@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cartez GPS Tracker</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background:#0f172a; color:#e2e8f0; margin:0; padding:20px; }
+    h1 { font-size:1.2rem; margin:0 0 16px; }
+    .card { background:#1e293b; border-radius:12px; padding:16px; margin-bottom:16px; }
+    label { display:block; font-size:.85rem; color:#94a3b8; margin-bottom:6px; }
+    select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #334155; background:#0f172a; color:#e2e8f0; box-sizing:border-box; }
+    button { width:100%; padding:14px; border-radius:10px; border:none; font-weight:600; font-size:1rem; margin-top:10px; cursor:pointer; }
+    .start { background:#d97706; color:#fff; }
+    .start:disabled { background:#475569; }
+    .stop { background:#ef4444; color:#fff; display:none; }
+    .status { font-size:.85rem; color:#94a3b8; margin-top:10px; }
+    .coords { font-family:monospace; font-size:1rem; color:#fbbf24; }
+    .server { width:100%; padding:10px; border-radius:8px; border:1px solid #334155; background:#0f172a; color:#e2e8f0; box-sizing:border-box; }
+    .pulse { color:#10b981; }
+  </style>
+</head>
+<body>
+  <h1>Cartez GPS Live Tracker</h1>
+
+  <div class="card">
+    <label>Server URL (your PC's local IP + path)</label>
+    <input class="server" id="serverUrl" value=" https://unpaid-smugness-rundown.ngrok-free.dev/Strona/ping_gps.php">
+  </div>
+
+  <div class="card">
+    <label>Select your vehicle</label>
+    <select id="vehicleId">
+      <option value="">Loading vehicles...</option>
+    </select>
+  </div>
+
+  <div class="card">
+    <div class="status" id="gpsStatus">GPS: not started</div>
+    <div class="coords" id="coords">—</div>
+    <div class="status" id="sendStatus" style="margin-top:10px;"></div>
+  </div>
+
+  <button class="start" id="startBtn">Start Tracking</button>
+  <button class="stop"   id="stopBtn">Stop Tracking</button>
+
+<script>
+// ---------- CONFIG ----------
+// Change this to the path that loads vehicles as JSON. We'll reuse ping_gps.php?list=1 below.
+const VEHICLES_URL = " https://unpaid-smugness-rundown.ngrok-free.dev/Strona/ping_gps.php?list=1";
+let serverUrl = document.getElementById('serverUrl').value;
+document.getElementById('serverUrl').addEventListener('input', e => { serverUrl = e.target.value; });
+
+// ---------- Load vehicles ----------
+async function loadVehicles() {
+  try {
+    const res = await fetch(VEHICLES_URL);
+    const data = await res.json();
+    const sel = document.getElementById('vehicleId');
+    if (!data.vehicles || data.vehicles.length === 0) {
+      sel.innerHTML = '<option value="">No vehicles in DB (add one in console first)</option>';
+      return;
+    }
+    sel.innerHTML = data.vehicles.map(v =>
+      `<option value="${v.vehicle_id}">${v.model_name} [${v.license_plate || '—'}]</option>`
+    ).join('');
+  } catch (e) {
+    document.getElementById('vehicleId').innerHTML =
+      '<option value="">Cannot reach server — check IP/URL</option>';
+  }
+}
+loadVehicles();
+
+// ---------- GPS tracking ----------
+let watchId = null;
+let lastLat = null, lastLng = null, lastTs = null;
+
+function startTracking() {
+  const vehicleId = document.getElementById('vehicleId').value;
+  if (!vehicleId) { alert('Pick a vehicle first'); return; }
+
+  if (!navigator.geolocation) {
+    alert('Geolocation not supported on this device');
+    return;
+  }
+
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('stopBtn').style.display = 'block';
+  document.getElementById('gpsStatus').textContent = 'GPS: requesting permission...';
+
+  watchId = navigator.geolocation.watchPosition(
+    pos => {
+      const { latitude, longitude, accuracy, speed, heading } = pos.coords;
+      const now = Date.now();
+
+      document.getElementById('gpsStatus').textContent =
+        `GPS: locked • accuracy ±${accuracy ? accuracy.toFixed(0) : '?'} m`;
+      document.getElementById('coords').textContent =
+        `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`;
+
+      // Heading/speed: phone GPS may not provide them, so estimate from delta
+      let useSpeed = speed != null ? speed * 3.6 : 0;          // m/s -> km/h
+      let useHeading = heading != null ? heading : 0;
+
+      if (lastLat != null && lastTs != null) {
+        const dt = (now - lastTs) / 1000;                       // seconds
+        const dist = haversine(lastLat, lastLng, latitude, longitude); // km
+        if (dt > 0) useSpeed = (dist / dt) * 3600;             // km/h
+        useHeading = bearing(lastLat, lastLng, latitude, longitude);
+      }
+      lastLat = latitude; lastLng = longitude; lastTs = now;
+
+      sendPing(vehicleId, latitude, longitude, useSpeed, useHeading);
+    },
+    err => {
+      document.getElementById('gpsStatus').textContent = 'GPS error: ' + err.message;
+    },
+    { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 }
+  );
+}
+
+function stopTracking() {
+  if (watchId != null) navigator.geolocation.clearWatch(watchId);
+  watchId = null;
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').style.display = 'none';
+  document.getElementById('gpsStatus').textContent = 'GPS: stopped';
+}
+
+document.getElementById('startBtn').addEventListener('click', startTracking);
+document.getElementById('stopBtn').addEventListener('click', stopTracking);
+
+// ---------- Send to server ----------
+async function sendPing(vehicleId, lat, lng, speed, heading) {
+  const el = document.getElementById('sendStatus');
+  try {
+    const res = await fetch(serverUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vehicle_id: vehicleId,
+        latitude: lat,
+        longitude: lng,
+        speed_kmh: Math.max(0, speed),
+        heading_degrees: ((heading % 360) + 360) % 360
+      })
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      el.textContent = `✓ Sent @ ${new Date().toLocaleTimeString()} (id ${data.telemetry_id})`;
+      el.className = 'status pulse';
+    } else {
+      el.textContent = '✗ Server: ' + (data.detail || 'unknown error');
+      el.className = 'status';
+    }
+  } catch (e) {
+    el.textContent = '✗ Network error: ' + e.message;
+    el.className = 'status';
+  }
+}
+
+// ---------- helpers ----------
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+function bearing(lat1, lon1, lat2, lon2) {
+  const toRad = d => d * Math.PI / 180, toDeg = r => r * 180 / Math.PI;
+  const y = Math.sin(toRad(lon2-lon1)) * Math.cos(toRad(lat2));
+  const x = Math.cos(toRad(lat1))*Math.sin(toRad(lat2)) -
+            Math.sin(toRad(lat1))*Math.cos(toRad(lat2))*Math.cos(toRad(lon2-lon1));
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+</script>
+</body>
+</html>
